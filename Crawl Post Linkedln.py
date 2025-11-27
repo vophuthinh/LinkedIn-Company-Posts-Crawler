@@ -24,6 +24,7 @@ Cài đặt:
 """
 import csv
 import json
+import logging
 import queue
 import random  # NÂNG CẤP: Thêm thư viện random
 import re
@@ -45,12 +46,105 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
+from selenium.common.exceptions import TimeoutException, WebDriverException
 
-ACCEPT_LANG = "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+# Import shared modules
+try:
+    from config import (
+        ACCEPT_LANG, USER_AGENT, MAX_STABLE_ROUNDS, RANDOM_DELAY_MIN, RANDOM_DELAY_MAX,
+        LONG_PAUSE_MIN, LONG_PAUSE_MAX, SCROLL_BASE_PX, SCROLL_VARIATION,
+        SCROLL_DELAY_MIN, SCROLL_DELAY_MAX, INNER_SCROLL_DELAY_MIN, INNER_SCROLL_DELAY_MAX,
+        BETWEEN_URL_DELAY_MIN, BETWEEN_URL_DELAY_MAX, SELECTORS, DEFAULT_WAIT_SEC,
+        DEFAULT_SCROLL_ROUNDS, DEFAULT_MAX_POSTS
+    )
+    from utils import (
+        normalize_time, inside_date_range, normalize_time_for_output,
+        url_to_slug, clean_text_keep_newlines, get_random_delay, get_long_pause,
+        should_take_long_pause
+    )
+    from validators import validate_all_inputs
+    from retry_handler import retry_on_failure, RetryConfig
+    from rate_limiter import get_rate_limiter, RateLimiter, AdaptiveRateLimiter
+except ImportError:
+    # Fallback for retry and rate limiting
+    def retry_on_failure(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    
+    class RetryConfig:
+        def __init__(self, max_attempts=3, base_delay=4.0, max_delay=30.0):
+            self.max_attempts = max_attempts
+            self.base_delay = base_delay
+            self.max_delay = max_delay
+    
+    def get_rate_limiter(*args, **kwargs):
+        class DummyRateLimiter:
+            def wait_if_needed(self):
+                return 0.0
+            def reset(self):
+                pass
+            def on_success(self):
+                pass
+            def on_rate_limit_error(self):
+                pass
+        return DummyRateLimiter()
+    
+    # Fallback constants nếu không có modules mới
+    # Fallback nếu không có modules mới
+    ACCEPT_LANG = "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"
+    USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+    MAX_STABLE_ROUNDS = 3
+    RANDOM_DELAY_MIN = 8
+    RANDOM_DELAY_MAX = 15
+    LONG_PAUSE_MIN = 5.0
+    LONG_PAUSE_MAX = 12.0
+    SCROLL_BASE_PX = 1100
+    SCROLL_VARIATION = 200
+    SCROLL_DELAY_MIN = 0.6
+    SCROLL_DELAY_MAX = 1.2
+    INNER_SCROLL_DELAY_MIN = 0.5
+    INNER_SCROLL_DELAY_MAX = 1.0
+    BETWEEN_URL_DELAY_MIN = 5.0
+    BETWEEN_URL_DELAY_MAX = 10.0
+    SELECTORS = {
+        'post_container': '.organization-content-list__posts-list-item, .feed-shared-update-v2',
+        'posts_link': 'a[href*="/posts/"]'
+    }
+    
+    # Fallback functions
+    def get_random_delay():
+        return random.uniform(BETWEEN_URL_DELAY_MIN, BETWEEN_URL_DELAY_MAX)
+    
+    def get_long_pause():
+        return random.uniform(LONG_PAUSE_MIN, LONG_PAUSE_MAX)
+    
+    def should_take_long_pause(round_index: int) -> bool:
+        if round_index > 0:
+            pause_interval = random.randint(RANDOM_DELAY_MIN, RANDOM_DELAY_MAX)
+            return round_index % pause_interval == 0
+        return False
+    
+    def validate_all_inputs(urls, start_date="", end_date="", wait_sec="", scroll_rounds="", max_posts=""):
+        # Simple validation fallback - basic checks only
+        if not urls:
+            return False, "Danh sách URL không được để trống", {}
+        validated = {'urls': urls}
+        if start_date:
+            validated['start_date'] = start_date
+        if end_date:
+            validated['end_date'] = end_date
+        return True, None, validated
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+logger = logging.getLogger(__name__)
 
 EXTRACT_JS = r"""
 // ---- LinkedIn company posts extractor (robust) ----
@@ -264,9 +358,9 @@ def normalize_time(time_iso: Optional[str], time_text: Optional[str]) -> Optiona
             except ValueError:
                 pass  # Not a date only
 
-        except Exception:
+        except Exception as e:
             # ISO format error - Fallback to relative time
-            pass
+            logger.debug(f"ISO format parse failed, using fallback: {e}")
 
             # 2. Fallback to relative time (time_text)
     if time_text:
@@ -292,7 +386,8 @@ def inside_date_range(
 
     try:
         dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Date parse failed for '{iso_str}', strict={strict}: {e}")
         return not strict  # Nâng cấp: Nếu parse lỗi và không strict, cho qua.
 
     if start and dt < start:
@@ -310,7 +405,8 @@ def url_to_slug(u: str) -> str:
             if seg == "company" and i + 1 < len(parts):
                 return re.sub(r"[^a-z0-9\-]+", "-", parts[i + 1].lower())
         return re.sub(r"[^a-z0-9\-]+", "-", (parts[-1] if parts else "company"))
-    except Exception:
+    except Exception as e:
+        logger.debug(f"URL slug extraction failed, using default: {e}")
         return "company"
 
 
@@ -331,10 +427,12 @@ def close_overlays(driver):
                 try:
                     driver.execute_script("arguments[0].click();", b)
                     time.sleep(0.2)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except WebDriverException as e:
+                    logger.debug(f"Error clicking overlay button: {e}")
+                except Exception as e:
+                    logger.debug(f"Unexpected error clicking button: {e}")
+        except Exception as e:
+            logger.debug(f"Error finding overlay elements: {e}")
 
 
 def init_driver(headless: bool, use_uc: bool, fast_mode: bool):
@@ -357,23 +455,23 @@ def init_driver(headless: bool, use_uc: bool, fast_mode: bool):
     opts.add_experimental_option("useAutomationExtension", False)
     try:
         opts.page_load_strategy = "eager"
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Could not set page_load_strategy (optional feature): {e}")
     prefs = {"intl.accept_languages": ACCEPT_LANG}
     if fast_mode:
         prefs["profile.managed_default_content_settings.images"] = 2
     try:
         opts.add_experimental_option("prefs", prefs)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Could not set experimental prefs (optional feature): {e}")
     driver = webdriver.Chrome(options=opts)
     try:
         driver.execute_cdp_cmd(
             "Page.addScriptToEvaluateOnNewDocument",
             {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"},
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Could not execute CDP command (optional anti-detection): {e}")
     return driver
 
 
@@ -383,18 +481,25 @@ def add_cookies_if_any(driver, cookie_path: Path) -> int:
         if cookie_path.exists():
             driver.get("https://www.linkedin.com/")
             time.sleep(1.0)
-            cookies = json.loads(cookie_path.read_text(encoding="utf-8")) or []
+            try:
+                cookies = json.loads(cookie_path.read_text(encoding="utf-8")) or []
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON in cookie file: {e}")
+                print("⚠ Không thể đọc cookies (file JSON không hợp lệ):", e)
+                return 0
+            
             for c in cookies:
                 if isinstance(c.get("expiry"), float):
                     c["expiry"] = int(c["expiry"])
                 try:
                     driver.add_cookie(c)
                     count += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Could not add cookie (domain mismatch or invalid): {e}")
             driver.get("https://www.linkedin.com/feed/")
             time.sleep(1.0)
     except Exception as e:
+        logger.error(f"Error loading cookies: {e}", exc_info=True)
         print("⚠ Không thể nạp cookies:", e)
     return count
 
@@ -407,19 +512,26 @@ def save_cookies(driver, cookie_path: Path) -> tuple[bool, int]:
             json.dumps(cookies, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         return True, len(cookies)
+    except PermissionError as e:
+        logger.error(f"Permission denied saving cookies: {e}")
+        print("⚠ Không thể lưu cookies (thiếu quyền ghi):", e)
+        return False, 0
     except Exception as e:
+        logger.error(f"Error saving cookies: {e}", exc_info=True)
         print("⚠ Không thể lưu cookies:", e)
         return False, 0
 
 
 # NÂNG CẤP: Ngẫu nhiên hóa hành vi cuộn
-def smart_scroll(driver, outer_rounds=2, base_step_px=1100):
+def smart_scroll(driver, outer_rounds=2, base_step_px=None):
+    if base_step_px is None:
+        base_step_px = SCROLL_BASE_PX
     for _ in range(outer_rounds):
         # Ngẫu nhiên hóa khoảng cách cuộn
-        scroll_amount = random.randint(base_step_px - 200, base_step_px + 200)
+        scroll_amount = random.randint(base_step_px - SCROLL_VARIATION, base_step_px + SCROLL_VARIATION)
         driver.execute_script(f"window.scrollBy(0, {scroll_amount});")
         # Ngẫu nhiên hóa thời gian chờ
-        time.sleep(random.uniform(0.6, 1.2))
+        time.sleep(random.uniform(SCROLL_DELAY_MIN, SCROLL_DELAY_MAX))
 
         driver.execute_script(
             """
@@ -428,7 +540,7 @@ def smart_scroll(driver, outer_rounds=2, base_step_px=1100):
             els.slice(0, 12).forEach(e => { e.scrollTop = e.scrollHeight; });
             """
         )
-        time.sleep(random.uniform(0.5, 1.0))
+        time.sleep(random.uniform(INNER_SCROLL_DELAY_MIN, INNER_SCROLL_DELAY_MAX))
 
 
 def normalize_time_for_output(iso_str: Optional[str]) -> Optional[str]:
@@ -439,7 +551,8 @@ def normalize_time_for_output(iso_str: Optional[str]) -> Optional[str]:
         vn = timezone(timedelta(hours=7))
         dt = dt.astimezone(vn)
         return dt.strftime("%d-%m-%Y")
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Date formatting failed for output: {e}")
         return None
 
 
@@ -461,7 +574,8 @@ def read_checkpoint(out_dir: Path) -> Optional[Dict]:
         return None
     try:
         return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Error reading checkpoint file: {e}")
         return None
 
 
@@ -470,13 +584,13 @@ def remove_checkpoint(out_dir: Path):
     if p.exists():
         try:
             p.unlink()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Error removing checkpoint: {e}")
 
 
 # ---- core scrape ----
 
-def scrape_url(
+def _scrape_url_internal(
         driver,
         url: str,
         wait_sec: int,
@@ -485,12 +599,12 @@ def scrape_url(
         start_dt: Optional[datetime],
         end_dt: Optional[datetime],
         apply_hashtag_fix: bool = True,
-        strict_date_filter: bool = False,  # Nâng cấp: Thêm strict flag
+        strict_date_filter: bool = False,
         update_progress=None,
         stop_flag=lambda: False,
-        app=None  # NÂNG CẤP: Thêm app để truy cập logger
+        app=None
 ) -> Tuple[Optional[List[Dict]], bool]:
-    """Return (rows, stopped_by_time_lower_bound)."""
+    """Internal scraping function (without retry wrapper)."""
     driver.get(url)
 
     close_overlays(driver)
@@ -498,33 +612,51 @@ def scrape_url(
         WebDriverWait(driver, 20).until(
             EC.presence_of_element_located((By.TAG_NAME, "body"))
         )
-    except Exception:
+    except TimeoutException:
+        logger.error(f"Timeout waiting for page to load: {url}")
+        if app:
+            app.log(f"  → ⚠ Timeout: Trang không tải được sau 20 giây")
+        return [], False
+    except WebDriverException as e:
+        logger.error(f"WebDriver error loading page: {e}")
+        if app:
+            app.log(f"  → ⚠ Lỗi trình duyệt: {e}")
         return [], False
 
     try:
         if "/posts" not in driver.current_url:
-            links = driver.find_elements(By.CSS_SELECTOR, 'a[href*="/posts/"]')
+            links = driver.find_elements(By.CSS_SELECTOR, SELECTORS.get('posts_link', 'a[href*="/posts/"]'))
             if links:
                 driver.execute_script("arguments[0].click();", links[0])
                 WebDriverWait(driver, wait_sec).until(lambda d: "/posts" in d.current_url)
         if "feedView=all" not in driver.current_url:
             base = driver.current_url.split("?")[0]
             driver.get(base + "?feedView=all")
-    except Exception:
-        pass
+    except TimeoutException:
+        logger.warning(f"Timeout navigating to posts page")
+        if app:
+            app.log(f"  → ⚠ Timeout khi chuyển đến trang posts")
+    except WebDriverException as e:
+        logger.warning(f"Error navigating to posts: {e}")
+        if app:
+            app.log(f"  → ⚠ Lỗi khi chuyển đến trang posts: {e}")
 
     try:
         # Thay thế lệnh chờ chi tiết bằng lệnh chờ chung cho phần thân (main content) của bài viết
+        post_selector = SELECTORS.get('post_container', '.organization-content-list__posts-list-item, .feed-shared-update-v2')
         WebDriverWait(driver, wait_sec).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR,
-                                            '.organization-content-list__posts-list-item, .feed-shared-update-v2'
-                                            ))
+            EC.presence_of_element_located((By.CSS_SELECTOR, post_selector))
         )
         if app:
             app.log("  → Đã tìm thấy khu vực bài post. Bắt đầu cuộn.")
-    except Exception as e:
+    except TimeoutException:
+        logger.warning(f"Timeout waiting for post container")
         if app:
-            app.log(f"  → ⚠ Timeout/Lỗi khi đợi khu vực bài post. Tiếp tục cuộn...")
+            app.log(f"  → ⚠ Timeout: Không tìm thấy khu vực bài post sau {wait_sec} giây. Tiếp tục cuộn...")
+    except Exception as e:
+        logger.warning(f"Error waiting for post container: {e}")
+        if app:
+            app.log(f"  → ⚠ Lỗi khi đợi khu vực bài post: {e}. Tiếp tục cuộn...")
 
     collected: Dict[str, Dict] = {}
     stable_rounds, prev_n = 0, -1
@@ -535,7 +667,15 @@ def scrape_url(
             break
         try:
             raw = driver.execute_script(EXTRACT_JS) or []
-        except Exception:
+        except WebDriverException as e:
+            logger.warning(f"Error executing extraction script: {e}")
+            if app:
+                app.log(f"  → ⚠ Lỗi khi trích xuất dữ liệu: {e}")
+            raw = []
+        except Exception as e:
+            logger.error(f"Unexpected error in extraction: {e}", exc_info=True)
+            if app:
+                app.log(f"  → ⚠ Lỗi không xác định khi trích xuất: {e}")
             raw = []
 
         for p in raw:
@@ -550,8 +690,11 @@ def scrape_url(
                         dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
                         if dt < start_dt:
                             stop_by_time_hit = True
-                    except Exception:
-                        pass
+                    except ValueError as e:
+                        logger.debug(f"Error parsing date for stop check: {e}")
+                        # Continue processing
+                    except Exception as e:
+                        logger.warning(f"Unexpected error checking date: {e}")
 
                 if inside_date_range(iso, start_dt, end_dt, strict=strict_date_filter):  # Nâng cấp: Dùng strict flag
                     collected[key] = {
@@ -570,19 +713,98 @@ def scrape_url(
             stable_rounds = 0
         prev_n = n
 
-        if n >= max_posts or stable_rounds >= 3 or stop_by_time_hit:
+        if n >= max_posts or stable_rounds >= MAX_STABLE_ROUNDS or stop_by_time_hit:
             break
 
         # NÂNG CẤP: Thêm khoảng nghỉ dài ngẫu nhiên
-        if i > 0 and i % random.randint(8, 15) == 0:
-            long_pause = random.uniform(5, 12)
+        if should_take_long_pause(i):
+            long_pause = get_long_pause()
             if app:
                 app.log(f"  → Tạm nghỉ dài {long_pause:.1f} giây để mô phỏng người dùng...")
             time.sleep(long_pause)
 
-        smart_scroll(driver, outer_rounds=2, base_step_px=1100)
+        smart_scroll(driver, outer_rounds=2, base_step_px=SCROLL_BASE_PX)
 
     return list(collected.values()), stop_by_time_hit
+
+
+def scrape_url(
+        driver,
+        url: str,
+        wait_sec: int,
+        scroll_rounds: int,
+        max_posts: int,
+        start_dt: Optional[datetime],
+        end_dt: Optional[datetime],
+        apply_hashtag_fix: bool = True,
+        strict_date_filter: bool = False,
+        update_progress=None,
+        stop_flag=lambda: False,
+        app=None,
+        use_retry: bool = True,
+        rate_limiter: RateLimiter = None
+) -> Tuple[Optional[List[Dict]], bool]:
+    """
+    Scrape LinkedIn company posts with optional retry mechanism and rate limiting.
+    
+    Args:
+        use_retry: Enable retry mechanism for network errors
+        rate_limiter: RateLimiter instance (creates default if None)
+    
+    Returns:
+        Tuple of (rows, stopped_by_time_lower_bound)
+    """
+    # Apply rate limiting before scraping
+    if rate_limiter:
+        wait_time = rate_limiter.wait_if_needed()
+        if wait_time > 0 and app:
+            app.log(f"  → Rate limiting: đã đợi {wait_time:.1f}s")
+    
+    if use_retry:
+        try:
+            from config import DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BASE_DELAY, DEFAULT_RETRY_MAX_DELAY
+            retry_config = RetryConfig(
+                max_attempts=DEFAULT_RETRY_ATTEMPTS,
+                base_delay=DEFAULT_RETRY_BASE_DELAY,
+                max_delay=DEFAULT_RETRY_MAX_DELAY
+            )
+        except ImportError:
+            retry_config = RetryConfig()
+        
+        def on_retry_callback(attempt, exception):
+            if app:
+                app.log(f"  → ⚠ Retry {attempt}/{retry_config.max_attempts}: {type(exception).__name__}")
+            logger.warning(f"Retry {attempt}/{retry_config.max_attempts} for {url}: {exception}")
+        
+        @retry_on_failure(retry_config, on_retry=on_retry_callback)
+        def _scrape_with_retry():
+            return _scrape_url_internal(
+                driver, url, wait_sec, scroll_rounds, max_posts,
+                start_dt, end_dt, apply_hashtag_fix, strict_date_filter,
+                update_progress, stop_flag, app
+            )
+        
+        try:
+            result = _scrape_with_retry()
+            # Notify rate limiter of success
+            if rate_limiter and hasattr(rate_limiter, 'on_success'):
+                rate_limiter.on_success()
+            return result
+        except Exception as e:
+            # Notify rate limiter of error
+            if rate_limiter and hasattr(rate_limiter, 'on_rate_limit_error'):
+                if "rate limit" in str(e).lower() or "429" in str(e):
+                    rate_limiter.on_rate_limit_error()
+            raise
+    else:
+        result = _scrape_url_internal(
+            driver, url, wait_sec, scroll_rounds, max_posts,
+            start_dt, end_dt, apply_hashtag_fix, strict_date_filter,
+            update_progress, stop_flag, app
+        )
+        if rate_limiter and hasattr(rate_limiter, 'on_success'):
+            rate_limiter.on_success()
+        return result
 
 
 def save_outputs(rows: List[Dict], out_dir: Path, url: str) -> Dict[str, str]:
@@ -632,25 +854,73 @@ class ScrapeThread(threading.Thread):
 
             out_dir = Path(app.var_outdir.get().strip() or ".")
             cookie_path = out_dir / "cookies.json"
+            is_headless = app.var_headless.get()
+            
+            # Load cookies if available
             if app.var_use_cookies.get() and cookie_path.exists():
                 loaded = add_cookies_if_any(driver, cookie_path)
                 app.log(f"Đã nạp {loaded} cookies từ: {cookie_path}")
+                # Verify cookies by checking if we can access LinkedIn
+                try:
+                    driver.get("https://www.linkedin.com/feed/")
+                    time.sleep(2)  # Wait for page to load
+                except Exception:
+                    pass
 
             # NÂNG CẤP: Sửa lại logic kiểm tra đăng nhập
-            if not driver.get_cookies() or "li_at" not in [c['name'] for c in driver.get_cookies()]:
-                app.log("Mở trang đăng nhập LinkedIn...")
-                driver.get("https://www.linkedin.com/login")
-                app.log("Đăng nhập trong Chrome, rồi bấm 'Tôi đã đăng nhập'.")
-                app.wait_login_event.clear()
-                app.enable_continue(True)
-                app.wait_login_event.wait()
-                app.enable_continue(False)
-                if app.var_use_cookies.get():
-                    ok, n = save_cookies(driver, cookie_path)
-                    if ok:
-                        app.log(f"Đã lưu {n} cookies → {cookie_path}")
-                    else:
-                        app.log("⚠ Không thể lưu cookies (xem log).")
+            cookies = driver.get_cookies() or []
+            cookie_names = [c['name'] for c in cookies]
+            if not cookies or "li_at" not in cookie_names:
+                if is_headless:
+                    # Headless mode: Cannot login manually, need cookies
+                    app.log("❌ Headless mode: Không có cookies hợp lệ!")
+                    app.log("⚠ Vui lòng tắt Headless mode để đăng nhập lần đầu, hoặc đảm bảo có cookies.json hợp lệ.")
+                    messagebox.showerror(
+                        "Lỗi đăng nhập",
+                        "Headless mode cần cookies hợp lệ để tự động đăng nhập.\n\n"
+                        "Giải pháp:\n"
+                        "1. Tắt Headless mode để đăng nhập lần đầu\n"
+                        "2. Hoặc đảm bảo có file cookies.json hợp lệ trong thư mục output"
+                    )
+                    return
+                else:
+                    # Non-headless: Show browser and wait for user login
+                    app.log("Mở trang đăng nhập LinkedIn...")
+                    driver.get("https://www.linkedin.com/login")
+                    app.log("Đăng nhập trong Chrome, rồi bấm 'Tôi đã đăng nhập'.")
+                    app.wait_login_event.clear()
+                    app.enable_continue(True)
+                    app.wait_login_event.wait()
+                    app.enable_continue(False)
+                    if app.var_use_cookies.get():
+                        ok, n = save_cookies(driver, cookie_path)
+                        if ok:
+                            app.log(f"Đã lưu {n} cookies → {cookie_path}")
+                        else:
+                            app.log("⚠ Không thể lưu cookies (xem log).")
+            else:
+                # Already logged in (cookies worked)
+                if is_headless:
+                    app.log("✅ Headless mode: Đã đăng nhập tự động bằng cookies")
+                else:
+                    app.log("✅ Đã đăng nhập (cookies hợp lệ)")
+
+            # Initialize rate limiter
+            try:
+                from config import (
+                    DEFAULT_RATE_LIMIT_REQUESTS, DEFAULT_RATE_LIMIT_WINDOW,
+                    DEFAULT_RATE_LIMIT_MIN_DELAY, USE_ADAPTIVE_RATE_LIMITER
+                )
+                rate_limiter = get_rate_limiter(
+                    max_requests=DEFAULT_RATE_LIMIT_REQUESTS,
+                    time_window=DEFAULT_RATE_LIMIT_WINDOW,
+                    min_delay=DEFAULT_RATE_LIMIT_MIN_DELAY,
+                    adaptive=USE_ADAPTIVE_RATE_LIMITER
+                )
+                app.log(f"Rate limiter: {DEFAULT_RATE_LIMIT_REQUESTS} requests/{DEFAULT_RATE_LIMIT_WINDOW}s")
+            except (ImportError, NameError):
+                rate_limiter = None
+                app.log("Rate limiter không khả dụng (sử dụng fallback)")
 
             urls = self.urls
             for idx in range(self.start_index, len(urls)):
@@ -679,8 +949,10 @@ class ScrapeThread(threading.Thread):
                     max_posts=int(app.var_max.get()), start_dt=start_dt, end_dt=end_dt,
                     apply_hashtag_fix=app.var_fix_hashtag.get(), update_progress=app.update_progress,
                     stop_flag=lambda: app.stop_requested,
-                    strict_date_filter=app.var_strict_date.get(),  # Nâng cấp: Truyền strict flag
-                    app=self.app
+                    strict_date_filter=app.var_strict_date.get(),
+                    app=self.app,
+                    use_retry=True,  # Enable retry mechanism
+                    rate_limiter=rate_limiter  # Use rate limiter
                 )
 
                 if result is None:  # Logic xử lý URL lỗi đã bị gỡ bỏ, nhưng để lại để phòng hờ
@@ -712,7 +984,7 @@ class ScrapeThread(threading.Thread):
                 )
 
                 if idx < len(urls) - 1:
-                    delay = random.uniform(5, 10)
+                    delay = get_random_delay()
                     app.log(f"  → Tạm nghỉ ngẫu nhiên {delay:.1f} giây...")
                     time.sleep(delay)
 
@@ -734,11 +1006,25 @@ class ScrapeThread(threading.Thread):
             app.log(f"❌ Lỗi: {e}")
             messagebox.showerror("Lỗi", str(e))
         finally:
+            # Auto save cookies before closing driver
+            try:
+                if app.driver and app.var_use_cookies.get():
+                    out_dir = Path(app.var_outdir.get().strip() or ".")
+                    cookie_path = out_dir / "cookies.json"
+                    ok, n = save_cookies(app.driver, cookie_path)
+                    if ok:
+                        app.log(f"💾 Đã tự động lưu {n} cookies → {cookie_path}")
+                    else:
+                        app.log("⚠ Không thể tự động lưu cookies (xem log)")
+            except Exception as e:
+                logger.warning(f"Error auto-saving cookies: {e}")
+            
+            # Close driver
             try:
                 if app.driver:
                     app.driver.quit()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Error closing driver (may already be closed): {e}")
             app.set_running(False)
 
 
@@ -906,21 +1192,49 @@ class App(tk.Tk):
                         self.txt_urls.insert("1.0", "\n".join(ck["urls"]))
                         self.var_start_date.set(ck.get("filters", {}).get("start", ""))
                         self.var_end_date.set(ck.get("filters", {}).get("end", ""))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Error loading checkpoint (will start fresh): {e}")
 
     def _on_start(self):
         if hasattr(self, "running") and self.running:
             messagebox.showinfo("Đang chạy", "Vui lòng đợi tác vụ hiện tại xong.")
             return
+        
+        # Collect URLs
         urls: List[str] = []
         if self.var_mode_batch.get():
             urls = [u.strip() for u in self.txt_urls.get("1.0", "end").splitlines() if u.strip()]
         else:
             urls = [self.var_url.get().strip()]
-        if not urls:
-            messagebox.showwarning("Thiếu URL", "Nhập ít nhất một URL.")
-            return
+        
+        # Validate inputs
+        try:
+            is_valid, error_msg, validated = validate_all_inputs(
+                urls=urls,
+                start_date=self.var_start_date.get(),
+                end_date=self.var_end_date.get(),
+                wait_sec=self.var_wait.get(),
+                scroll_rounds=self.var_rounds.get(),
+                max_posts=self.var_max.get()
+            )
+            
+            if not is_valid:
+                messagebox.showerror("Lỗi nhập liệu", error_msg)
+                return
+            
+            # Use validated URLs
+            urls = validated.get('urls', urls)
+            
+            # Show warnings if any
+            if error_msg and "Tìm thấy" in error_msg:
+                if not messagebox.askyesno("Cảnh báo", error_msg + "\n\nTiếp tục với các URL hợp lệ?"):
+                    return
+        except Exception as e:
+            logger.error(f"Error validating inputs: {e}", exc_info=True)
+            # Fallback to basic validation
+            if not urls:
+                messagebox.showwarning("Thiếu URL", "Nhập ít nhất một URL.")
+                return
 
         start_index = 0
         ck = read_checkpoint(Path(self.var_outdir.get().strip() or "."))
@@ -1002,7 +1316,8 @@ class App(tk.Tk):
                     tzinfo=timezone(timedelta(hours=7))
                 )
                 return d_local.astimezone(timezone.utc)
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Date parsing failed for '{s}': {e}")
                 return None
 
         s_raw = self.var_start_date.get()
